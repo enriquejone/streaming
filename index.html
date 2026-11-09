@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Streaming quality checker</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+<h1>Streaming quality checker</h1>
+<p class="lead">Test your connection, then see which video quality will play smoothly without buffering.</p>
+
+<section class="panel" aria-label="Speed test">
+  <div class="top">
+    <div class="speed"><span class="num" id="mbps" aria-live="polite">&ndash;</span><span class="unit">Mbps</span></div>
+    <button class="go" id="go">Start test</button>
+  </div>
+  <p class="status" id="status">Ready when you are. The test takes about 10 seconds.</p>
+  <div class="stats">
+    <div class="stat"><b id="sLat">&ndash;</b><span>Latency (ms)</span></div>
+    <div class="stat"><b id="sJit">&ndash;</b><span>Jitter (ms)</span></div>
+    <div class="stat"><b id="sNet">&ndash;</b><span>Reported by browser</span></div>
+  </div>
+</section>
+
+<div class="verdict" id="verdict" hidden>
+  <p class="rp" id="vTitle"></p>
+  <p id="vText"></p>
+  <p class="warn" id="vWarn" hidden></p>
+</div>
+
+<div class="row">
+  <h2>Quality ladder</h2>
+  <span class="lbl">Devices streaming at once</span>
+  <div class="seg" role="group" aria-label="Devices streaming at once" id="seg"></div>
+</div>
+<ol id="ladder"></ol>
+
+<p class="note">The speed test downloads a few small files from a public CDN, so it measures your connection to that network. Results can differ from your streaming service’s servers, and Wi-Fi strength changes from room to room. Run it a couple of times for a fair picture. Quality tiers assume typical streaming bitrates with 25% headroom for fluctuations.</p>
+</main>
+
+<script>
+(function(){
+var R=[
+ {p:'240p',m:0.4,u:'Data saver, very small screens'},
+ {p:'360p',m:0.7,u:'Phones on limited data'},
+ {p:'480p',m:1.5,u:'Standard definition, small screens'},
+ {p:'720p',m:3,u:'HD, laptops and tablets'},
+ {p:'1080p',m:6,u:'Full HD, most TVs'},
+ {p:'1440p',m:10,u:'Sharp on large monitors'},
+ {p:'4K',m:18,u:'Ultra HD and HDR on a big screen'}
+];
+var BASE='https://cdnjs.cloudflare.com/ajax/libs/';
+var FILES=[
+ {u:BASE+'three.js/r128/three.min.js',b:135000},
+ {u:BASE+'d3/7.8.5/d3.min.js',b:95000},
+ {u:BASE+'mathjs/12.4.1/math.min.js',b:230000},
+ {u:BASE+'lodash.js/4.17.21/lodash.min.js',b:25000}
+];
+var PING=BASE+'lodash.js/4.17.21/lodash.min.js';
+var $=function(id){return document.getElementById(id)};
+var st={speed:null,lat:null,jit:null,dev:1,busy:false};
+
+function load(url){
+  return new Promise(function(res){
+    var u=url+'?cb='+Date.now()+Math.random().toString(36).slice(2,7);
+    var s=document.createElement('script'),t0=performance.now(),done=false;
+    function fin(ok){
+      if(done)return;done=true;
+      var ms=performance.now()-t0,e=null;
+      try{e=performance.getEntriesByName(u)[0]||null}catch(x){}
+      if(s.parentNode)s.parentNode.removeChild(s);
+      res({ok:ok,ms:ms,e:e});
+    }
+    s.onload=function(){fin(true)};s.onerror=function(){fin(false)};
+    s.async=true;s.src=u;document.head.appendChild(s);
+  });
+}
+function median(a){var b=a.slice().sort(function(x,y){return x-y});var n=b.length;return n?(n%2?b[(n-1)/2]:(b[n/2-1]+b[n/2])/2):0}
+
+async function measureLatency(){
+  var v=[];
+  for(var i=0;i<5;i++){
+    var r=await load(PING);
+    if(!r.ok)continue;
+    var t=r.e&&r.e.responseStart>0&&r.e.requestStart>0?r.e.responseStart-r.e.requestStart:r.ms;
+    v.push(t);
+  }
+  if(!v.length)return null;
+  var d=0;for(var j=1;j<v.length;j++)d+=Math.abs(v[j]-v[j-1]);
+  return {lat:median(v),jit:v.length>1?d/(v.length-1):0};
+}
+
+async function measureSpeed(rtt,onRound){
+  var rounds=[],ROUNDS=3;
+  for(var k=0;k<ROUNDS;k++){
+    var t0=performance.now();
+    var out=await Promise.all(FILES.map(function(f){return load(f.u).then(function(r){r.est=f.b;return r})}));
+    var secs=(performance.now()-t0)/1000;
+    var okAll=out.filter(function(r){return r.ok});
+    if(!okAll.length)continue;
+    var bytes=okAll.reduce(function(a,r){
+      var b=r.e&&(r.e.encodedBodySize||r.e.transferSize);
+      return a+(b>0?b:r.est);
+    },0);
+    var eff=Math.max(0.05,secs-(rtt||0)/1000);
+    var mbps=bytes*8/eff/1e6;
+    rounds.push(mbps);
+    onRound(k+1,ROUNDS,mbps);
+  }
+  return rounds.length?median(rounds):null;
+}
+
+function netInfo(){
+  var c=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+  if(!c)return null;
+  return {type:c.effectiveType,down:c.downlink,save:c.saveData};
+}
+
+function fmt(n){return n>=100?Math.round(n):n>=10?n.toFixed(1):n.toFixed(2)}
+
+function classify(){
+  var usable=st.speed/st.dev,sust=usable*0.75;
+  return R.map(function(r){
+    return r.m<=sust?'ok':r.m<=usable?'tight':'slow';
+  });
+}
+
+function stability(){
+  if(st.lat==null)return 'good';
+  if(st.lat>150||st.jit>40)return 'poor';
+  if(st.lat>80||st.jit>20)return 'fair';
+  return 'good';
+}
+
+function render(){
+  var L=$('ladder');
+  if(!L.children.length){
+    R.forEach(function(r){
+      var li=document.createElement('li');li.className='rung';li.id='r-'+r.p;
+      li.innerHTML='<span class="rp">'+r.p+'</span><span class="d">'+r.u+'</span><span class="need"><span class="tag"></span><br>needs '+r.m+' Mbps</span><span class="bar"><i></i></span>';
+      L.appendChild(li);
+    });
+  }
+  var cls=st.speed==null?null:classify(),best=-1;
+  if(cls){
+    for(var i=R.length-1;i>=0;i--){if(cls[i]==='ok'){best=i;break}}
+    if(best<0){for(var j=R.length-1;j>=0;j--){if(cls[j]==='tight'){best=j;break}}}
+    if(best<0)best=0;
+    if(stability()==='poor'&&best>0)best-=1;
+  }
+  R.forEach(function(r,i){
+    var li=$('r-'+r.p);
+    if(!cls){li.removeAttribute('data-s');li.classList.remove('best');li.querySelector('.tag').textContent='';li.querySelector('.bar i').style.width='0';return}
+    li.dataset.s=cls[i];
+    li.classList.toggle('best',i===best);
+    li.querySelector('.tag').textContent=i===best?'Best for you':cls[i]==='ok'?'Smooth':cls[i]==='tight'?'Tight':'Too slow';
+    li.querySelector('.bar i').style.width=Math.min(100,(st.speed/st.dev)/r.m*100)+'%';
+  });
+  var v=$('verdict');
+  if(!cls){v.hidden=true;return}
+  var r=R[best],usable=st.speed/st.dev,ratio=usable/r.m;
+  v.hidden=false;
+  $('vTitle').textContent='Stream at '+r.p;
+  $('vText').textContent='You have about '+fmt(usable)+' Mbps per device'+(st.dev>1?' (split across '+st.dev+')':'')+', roughly '+(ratio>=10?Math.round(ratio):ratio.toFixed(1))+'× what '+r.p+' needs.'+(best<R.length-1&&cls[best]==='ok'?' The next step up is too demanding for steady playback.':'');
+  var w=$('vWarn'),s=stability();
+  if(s==='poor'){w.hidden=false;w.textContent='Your connection is unstable (high latency or jitter), so we dropped one step to avoid buffering. Try moving closer to your router or using a cable.'}
+  else if(s==='fair'){w.hidden=false;w.textContent='Latency is a little variable. If playback stutters, choose one step lower.'}
+  else if(cls[best]==='slow'||cls[best]==='tight'){w.hidden=false;w.textContent='Your speed is close to the minimum, so expect occasional buffering. Pause other downloads while you watch.'}
+  else w.hidden=true;
+}
+
+function setDevices(n){
+  st.dev=n;
+  Array.prototype.forEach.call($('seg').children,function(b){b.setAttribute('aria-pressed',String(+b.dataset.n===n))});
+  render();
+}
+
+(function buildSeg(){
+  [1,2,3,4].forEach(function(n){
+    var b=document.createElement('button');b.type='button';b.textContent=n;b.dataset.n=n;
+    b.setAttribute('aria-pressed',String(n===1));
+    b.addEventListener('click',function(){setDevices(n)});
+    $('seg').appendChild(b);
+  });
+})();
+
+function showNet(){
+  var n=netInfo();
+  $('sNet').textContent=n?(n.type?n.type.toUpperCase():'')+(n.down?' ('+n.down+' Mbps)':''):'Not available';
+}
+
+$('go').addEventListener('click',async function(){
+  if(st.busy)return;
+  if(navigator.onLine===false){$('status').textContent='You appear to be offline. Connect to the internet and try again.';return}
+  st.busy=true;var b=$('go');b.disabled=true;b.textContent='Testing…';
+  $('mbps').textContent='…';
+  try{
+    $('status').textContent='Measuring latency…';
+    var lt=await measureLatency();
+    if(lt){st.lat=lt.lat;st.jit=lt.jit;$('sLat').textContent=Math.round(lt.lat);$('sJit').textContent=Math.round(lt.jit)}
+    var sp=await measureSpeed(lt?lt.lat:0,function(i,n,m){
+      $('status').textContent='Measuring download speed, round '+i+' of '+n+'…';
+      $('mbps').textContent=fmt(m);
+    });
+    showNet();
+    var n=netInfo();
+    if(sp==null&&n&&n.down){
+      sp=n.down;
+      $('status').textContent='The speed test was blocked, so this is your browser’s own estimate.';
+    }else if(sp==null){
+      $('mbps').textContent='–';
+      $('status').textContent='The test could not reach the test server. Check your connection or any ad blocker, then try again.';
+    }else{
+      $('status').textContent='Done. Run it again anytime to compare.';
+    }
+    if(sp!=null){st.speed=sp;$('mbps').textContent=fmt(sp);render()}
+  }catch(e){
+    $('mbps').textContent='–';
+    $('status').textContent='Something went wrong during the test. Try again.';
+  }
+  st.busy=false;b.disabled=false;b.textContent='Test again';
+});
+
+showNet();render();
+})();
+</script>
+</body>
+</html>
